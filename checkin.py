@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import logging
+import re
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -93,6 +94,43 @@ def log_method(func):
     return wrapper
 
 
+def normalize_cookie(raw: str) -> str:
+    """接受单行 Cookie 或单账号 Cookie-Editor 数组，不在异常中包含原值。"""
+    text = raw.strip()
+    if text.startswith("["):
+        try:
+            entries = json.loads(text)
+            if not isinstance(entries, list) or not entries:
+                raise ValueError
+            parts = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError
+                name, value = entry.get("name"), entry.get("value")
+                if not isinstance(name, str) or not isinstance(value, str):
+                    raise ValueError
+                if ";" in value:
+                    raise ValueError
+                parts.append(f"{name}={value}")
+            text = "; ".join(parts)
+        except (ValueError, TypeError):
+            raise ValueError("Cookie JSON 格式无效，请复制成功请求的完整 Cookie 值。") from None
+    if text.lower().startswith("cookie:"):
+        text = text[7:].strip()
+    if any(ord(char) < 32 or ord(char) > 126 for char in text):
+        raise ValueError("Cookie 必须为单行 ASCII 请求头值。")
+    parts = [part.strip() for part in text.split(";") if part.strip()]
+    names = set()
+    for part in parts:
+        name, separator, value = part.partition("=")
+        if not separator or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z:-]+", name) or name in names:
+            raise ValueError("Cookie 格式无效或字段重复，请复制单个登录域名的完整请求头值。")
+        names.add(name)
+    if not parts:
+        raise ValueError("Cookie 为空。")
+    return "; ".join(parts)
+
+
 class Config:
     """应用配置"""
 
@@ -100,6 +138,8 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_DOMAIN = "GLADOS_DOMAIN"
+    ENV_USER_AGENT = "GLADOS_USER_AGENT"
 
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
@@ -108,7 +148,8 @@ class Config:
     DEFAULT_VERBOSE = False
 
     """默认域名"""
-    DOMAINS = ["glados.cloud", "railgun.info"]
+    DOMAINS = ["glados.network"]
+    ALLOWED_DOMAINS = {"glados.network", "glados.cloud", "railgun.info"}
 
     """兑换计划列表"""
     EXCHANGE_PLANS = {
@@ -122,10 +163,19 @@ class Config:
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
+        self.user_agent: str = ""
         self._load_config()
 
     def _load_config(self) -> None:
         """加载配置"""
+        domain = os.environ.get(self.ENV_DOMAIN, "").strip().lower() or self.DOMAINS[0]
+        if domain not in self.ALLOWED_DOMAINS:
+            raise ValueError("GLADOS_DOMAIN 必须是支持的主机名：glados.network / glados.cloud / railgun.info。")
+        self.DOMAINS = [domain]
+        self.user_agent = os.environ.get(self.ENV_USER_AGENT, "").strip()
+        if any(ord(char) < 32 or ord(char) > 126 for char in self.user_agent):
+            raise ValueError("GLADOS_USER_AGENT 必须为单行 ASCII 请求头值。")
+        logger.info(f"登录域名: {domain}；浏览器 UA: {'已配置' if self.user_agent else '默认'}")
         push_key_env: Optional[str] = os.environ.get(self.ENV_PUSH_KEY)
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
@@ -141,7 +191,10 @@ class Config:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
             self.cookies_list = []
         else:
-            self.cookies_list = [cookie.strip() for cookie in raw_cookies_env.split("&") if cookie.strip()]
+            # JSON 是单账号数组，值中的 & 不应被当作多账号分隔符。
+            cookie_inputs = ([raw_cookies_env] if raw_cookies_env.lstrip().startswith("[")
+                             else raw_cookies_env.split("&"))
+            self.cookies_list = [normalize_cookie(cookie) for cookie in cookie_inputs if cookie.strip()]
             if not self.cookies_list:
                 raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
 
@@ -190,14 +243,14 @@ class API:
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
 
-    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False):
+    def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False, user_agent: str = ""):
         self.domain: str = domain
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
+        self.user_agent = user_agent
         self.headers: Dict[str, str] = self._get_headers()
         self._device_ua_cache: Dict[str, str] = {}
         self.session = requests.Session()
-        self.session.headers.update(self.headers)
         # 网络抖动时自动重试（指数退避），避免误报失败
         retry_strategy = Retry(
             total=3,
@@ -231,12 +284,24 @@ class API:
         self.close()
         return False
 
-    def _get_headers(self) -> Dict[str, str]:
-        """获取请求头"""
-        return {
+    def _get_headers(self, user_agent: Optional[str] = None) -> Dict[str, str]:
+        """每次按实际 UA 构建请求头，避免设备重试携带上次平台的 Client Hints。"""
+        ua = user_agent or self.user_agent or PLATFORM_UA["Windows"]
+        headers = {
             "origin": f"https://{self.domain}",
-            "user-agent": PLATFORM_UA["Windows"],
+            "referer": f"https://{self.domain}/console/checkin",
+            "user-agent": ua,
         }
+        chromium = re.search(r"(?:Chrome|Chromium)/(\d+)", ua)
+        if chromium:
+            for token, platform in (("Android", "Android"), ("Windows", "Windows"),
+                                    ("Macintosh", "macOS"), ("Linux", "Linux")):
+                if token in ua:
+                    headers["sec-ch-ua-platform"] = f'"{platform}"'
+                    break
+            headers["sec-ch-ua"] = f'"Chromium";v="{chromium.group(1)}"'
+            headers["sec-ch-ua-mobile"] = "?1" if "Mobile" in ua else "?0"
+        return headers
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
         """统一日志输出方法"""
@@ -257,26 +322,27 @@ class API:
 
     def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
         """发送 HTTP 请求"""
-        session_headers = self.headers.copy()
-        if user_agent:
-            session_headers["user-agent"] = user_agent
+        session_headers = self._get_headers(user_agent)
         session_headers["cookie"] = cookies
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                # 新版签到使用 JSON；兑换接口仍需表单。
+                payload = {"json": data} if url == self._get_full_url(self.CHECKIN_URL) else {"data": data}
+                response = self.session.post(url, headers=session_headers, timeout=(60, 120),
+                                             allow_redirects=False, **payload)
             elif method.upper() == "GET":
-                response = self.session.get(url, headers=session_headers, timeout=(60, 120))
+                response = self.session.get(url, headers=session_headers, timeout=(60, 120), allow_redirects=False)
             else:
                 self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
                 return None
 
-            if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+            if not 200 <= response.status_code < 300:
+                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。", force=True)
                 return None
             return response
         except requests.exceptions.RequestException as e:
-            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
+            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {type(e).__name__}", force=True)
             return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
@@ -298,7 +364,7 @@ class API:
         if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
             login_device = raw.get("loginDevice")
             recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
-            if recover_ua and recover_ua != start_ua:
+            if not self.user_agent and recover_ua and recover_ua != start_ua:
                 self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
                 raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
 
@@ -360,6 +426,10 @@ class API:
             result["status"] = "签到失败"
             result["points"] = "0"
             result["message"] = message
+            if code == -2:
+                self._log("warning", LogEmoji.WARNING,
+                          "鉴权被拒绝：核对登录域名、完整会话及签名和同一浏览器的 GLADOS_USER_AGENT；不会重试鉴权失败。",
+                          force=True)
 
         return result
 
@@ -515,7 +585,7 @@ class Checker:
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
 
-        with API(domain, cookie_idx, verbose=self.config.verbose) as api:
+        with API(domain, cookie_idx, verbose=self.config.verbose, user_agent=self.config.user_agent) as api:
             # 1. 获取状态
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
             days_str, status_code = api.get_status(cookie)

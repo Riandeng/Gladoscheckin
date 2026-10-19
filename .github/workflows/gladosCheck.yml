@@ -13,7 +13,7 @@ on:
 
 jobs:
   build:
-    name: glados/railgun checkin
+    name: GLaDOS checkin
     runs-on: ubuntu-latest
       
     permissions:
@@ -51,6 +51,8 @@ jobs:
       env:
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        GLADOS_DOMAIN: ${{ vars.GLADOS_DOMAIN || 'glados.network' }}
+        GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
