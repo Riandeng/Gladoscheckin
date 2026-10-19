@@ -20,7 +20,7 @@ class CheckinTests(unittest.TestCase):
                 response.status_code = 200
                 response.json = Mock(return_value=payload)
                 responses.append(response)
-        with patch.dict(os.environ, {'GLADOS_COOKIES': 'fixture=value'}, clear=True), \
+        with patch.dict(os.environ, {'GLADOS_COOKIES': 'fixture=value&fixture=other'}, clear=True), \
                 patch.object(checkin.API, '_make_request', side_effect=responses) as request, \
                 patch.object(checkin.PushService, 'send', side_effect=RuntimeError() if notify_error else None) as send:
             result = checkin.main()
