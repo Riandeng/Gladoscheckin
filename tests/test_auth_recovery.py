@@ -63,6 +63,17 @@ class AuthRecoveryTests(unittest.TestCase):
         self.assertEqual(len(sent), 3)
         self.assertFalse(any(request.url.endswith('/exchange') for request in sent))
 
+    def test_points_auth_refusal_stops_exchange(self):
+        for status, payload in ((200, {'code': -2}), (401, {}), (403, {})):
+            with self.subTest(status=status):
+                code, sent, _, logs = self.run_responses([
+                    (200, {'code': 0, 'data': {'leftDays': 10}}),
+                    (200, {'code': 0, 'points': 1}),
+                    (status, payload)])
+                self.assertEqual(code, 1)
+                self.assertEqual(len(sent), 3)
+                self.assertIn('积分查询鉴权失败', logs)
+
     def test_success_still_allows_explicit_exchange(self):
         code, sent, _, _ = self.run_responses([
             (200, {'code': 0, 'data': {'leftDays': 10}}),

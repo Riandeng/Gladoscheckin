@@ -480,6 +480,8 @@ class API:
 
         if response:
             data = response.json()
+            if data.get("code") == -2:
+                self.auth_rejected = True
             code = data.get("code", -2)
             points = data.get("points", None)
 
@@ -625,6 +627,11 @@ class Checker:
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
+            if api.auth_rejected:
+                result.code = CheckinStatus.FAILURE
+                result.status = "签到已完成，但积分查询鉴权失败；请更新登录凭据"
+                result.exchange = "鉴权失败，跳过兑换"
+                return result
 
             # 4. 执行兑换（未配置有效兑换计划时跳过）
             if (result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
