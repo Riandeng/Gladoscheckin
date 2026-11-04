@@ -13,9 +13,11 @@ class CheckinTests(unittest.TestCase):
     def run_main(self, codes, notify_error=False):
         responses = []
         for code in codes:
-            for payload in ({'code': 0, 'data': {'leftDays': 1}},
-                            {'code': code, 'message': 'fixture', 'points': 1},
-                            {'code': 0, 'points': 1}):
+            payloads = [{'code': 0, 'data': {'leftDays': 1}},
+                        {'code': code, 'message': 'fixture', 'points': 1}]
+            if code != -2:
+                payloads.append({'code': 0, 'points': 1})
+            for payload in payloads:
                 response = requests.Response()
                 response.status_code = 200
                 response.json = Mock(return_value=payload)
@@ -24,7 +26,7 @@ class CheckinTests(unittest.TestCase):
                 patch.object(checkin.API, '_make_request', side_effect=responses) as request, \
                 patch.object(checkin.PushService, 'send', side_effect=RuntimeError() if notify_error else None) as send:
             result = checkin.main()
-            self.assertEqual(request.call_count, 6)
+            self.assertEqual(request.call_count, sum(2 if code == -2 else 3 for code in codes))
             self.assertEqual(send.call_count, 1)
             return result
 
