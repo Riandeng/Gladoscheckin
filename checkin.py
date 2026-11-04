@@ -77,7 +77,7 @@ def log_method(func):
 
             DEFAULT_ERRORS = {
                 "checkin": {"status": "签到失败", "points": "0", "message": ""},
-                "get_status": ("None 天", -2),
+                "get_status": ("None 天", None),
                 "get_points": ("None 积分", 0),
                 "exchange": "",
             }
@@ -140,6 +140,7 @@ class Config:
     ENV_VERBOSE = "GLADOS_VERBOSE"
     ENV_DOMAIN = "GLADOS_DOMAIN"
     ENV_USER_AGENT = "GLADOS_USER_AGENT"
+    ENV_DIAGNOSE_ONLY = "GLADOS_DIAGNOSE_ONLY"
 
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
@@ -164,6 +165,7 @@ class Config:
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self.user_agent: str = ""
+        self.diagnose_only = False
         self._load_config()
 
     def _load_config(self) -> None:
@@ -173,6 +175,7 @@ class Config:
             raise ValueError("GLADOS_DOMAIN 必须是支持的主机名：glados.network / glados.cloud / railgun.info。")
         self.DOMAINS = [domain]
         self.user_agent = os.environ.get(self.ENV_USER_AGENT, "").strip()
+        self.diagnose_only = os.environ.get(self.ENV_DIAGNOSE_ONLY, "").strip().lower() in ("true", "1", "yes")
         if any(ord(char) < 32 or ord(char) > 126 for char in self.user_agent):
             raise ValueError("GLADOS_USER_AGENT 必须为单行 ASCII 请求头值。")
         logger.info(f"登录域名: {domain}；浏览器 UA: {'已配置' if self.user_agent else '默认'}")
@@ -248,6 +251,7 @@ class API:
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
         self.user_agent = user_agent
+        self.auth_rejected = False
         self.headers: Dict[str, str] = self._get_headers()
         self._device_ua_cache: Dict[str, str] = {}
         self.session = requests.Session()
@@ -337,6 +341,8 @@ class API:
                 self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
                 return None
 
+            if response.status_code in (401, 403):
+                self.auth_rejected = True
             if not 200 <= response.status_code < 300:
                 self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。", force=True)
                 return None
@@ -381,6 +387,10 @@ class API:
             self._log("error", LogEmoji.ERROR, "签到响应解析失败", force=True)
             return None
 
+        if not isinstance(raw, dict):
+            self._log("error", LogEmoji.ERROR, "签到响应格式无效", force=True)
+            return None
+
         # 缓存学得的设备 UA，供本次运行后续请求复用
         if raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
             login_device = raw.get("loginDevice")
@@ -404,6 +414,8 @@ class API:
             result["message"] = "网络请求失败"
             return result
 
+        if raw.get("code") == -2 or raw.get("reason") == "device-mismatch":
+            self.auth_rejected = True
         code = raw.get("code", -2)
         message = raw.get("message", "无消息字段")
         points = str(raw.get("points", 0))
@@ -434,7 +446,7 @@ class API:
         return result
 
     @log_method
-    def get_status(self, cookies: str) -> Tuple[str, int]:
+    def get_status(self, cookies: str) -> Tuple[str, Optional[int]]:
         """获取状态"""
 
         url = self._get_full_url(self.STATUS_URL)
@@ -442,7 +454,11 @@ class API:
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
+            if not isinstance(data, dict):
+                return "None 天", None
+            if data.get("code") == -2:
+                self.auth_rejected = True
+            code = data.get("code")
             left_days = data.get("data", {}).get("leftDays", None)
 
             if left_days is not None:
@@ -454,7 +470,7 @@ class API:
                 return "None 天", code
         else:
             self._log("warning", LogEmoji.WARNING, "获取状态失败", force=True)
-            return "None 天", -2
+            return "None 天", None
 
     @log_method
     def get_points(self, cookies: str) -> Tuple[str, int]:
@@ -464,6 +480,8 @@ class API:
 
         if response:
             data = response.json()
+            if data.get("code") == -2:
+                self.auth_rejected = True
             code = data.get("code", -2)
             points = data.get("points", None)
 
@@ -590,20 +608,35 @@ class Checker:
             self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
             days_str, status_code = api.get_status(cookie)
             result.days = days_str
+            if api.auth_rejected:
+                result.status = "鉴权失败：更新 GLADOS_COOKIES 并核对登录域名和 GLADOS_USER_AGENT"
+                result.exchange = "鉴权失败，跳过后续请求"
+                return result
 
             # 2. 签到
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            if api.auth_rejected:
+                result.status = "鉴权失败：更新 GLADOS_COOKIES 并核对登录域名和 GLADOS_USER_AGENT"
+                result.exchange = "鉴权失败，跳过后续请求"
+                return result
 
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
+            if api.auth_rejected:
+                result.code = CheckinStatus.FAILURE
+                result.status = "签到已完成，但积分查询鉴权失败；请更新登录凭据"
+                result.exchange = "鉴权失败，跳过兑换"
+                return result
 
             # 4. 执行兑换（未配置有效兑换计划时跳过）
-            if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
+            if (result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+                    and not api.auth_rejected
+                    and self.config.exchange_plan in self.config.EXCHANGE_PLANS):
                 required_points = self.config.EXCHANGE_PLANS[self.config.exchange_plan]
                 self._log(
                     cookie_idx,
@@ -613,8 +646,8 @@ class Checker:
                 )
                 result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
             else:
-                result.exchange = "未配置兑换计划，跳过自动兑换"
-                self._log(cookie_idx, domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换", force=True)
+                result.exchange = "未配置兑换计划或签到/鉴权失败，跳过自动兑换"
+                self._log(cookie_idx, domain, LogEmoji.INFO, result.exchange, force=True)
 
         return result
 
@@ -649,6 +682,35 @@ class Checker:
         return title, content, log_content
 
 
+def diagnose_auth(config: Config) -> int:
+    """只请求状态接口；不签到、兑换、推送或输出响应内容。"""
+    if not config.cookies_list:
+        logger.error("只读验证失败：未配置 GLADOS_COOKIES。")
+        return 1
+    all_valid = True
+    for index, cookie in enumerate(config.cookies_list, 1):
+        for domain in config.DOMAINS:
+            with API(domain, index, user_agent=config.user_agent) as api:
+                response = api._make_request(api._get_full_url(api.STATUS_URL), "GET", cookies=cookie)
+                payload = None
+                if response is not None:
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        pass
+                code = payload.get("code") if isinstance(payload, dict) else None
+                if type(code) is int and code == 0:
+                    logger.info(f"Cookie [{index}] [{domain}] 状态鉴权通过；尚未验证签到设备校验。")
+                else:
+                    all_valid = False
+                    if api.auth_rejected or (type(code) is int and code == -2):
+                        reason = "鉴权被拒绝，请更新 GLADOS_COOKIES 并核对登录域名和 GLADOS_USER_AGENT"
+                    else:
+                        reason = "状态请求或响应异常，不能据此判断 Cookie 已过期"
+                    logger.error(f"Cookie [{index}] [{domain}] 只读验证失败：{reason}。")
+    return 0 if all_valid else 1
+
+
 # 初始化日志
 logger = init_logger()
 
@@ -661,6 +723,8 @@ def main() -> int:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
         config = Config()
+        if config.diagnose_only:
+            return diagnose_auth(config)
 
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
@@ -688,7 +752,7 @@ def main() -> int:
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    if config is not None:
+    if config is not None and not config.diagnose_only:
         try:
             PushService(config).send(title, content)
         except Exception:

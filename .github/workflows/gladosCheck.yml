@@ -2,6 +2,11 @@ name: auto check
 
 on:
   workflow_dispatch:
+    inputs:
+      diagnose_only:
+        description: '仅验证登录状态，不签到、兑换或推送'
+        type: boolean
+        default: false
   push:
     branches: [ master ]
     paths-ignore:
@@ -52,14 +57,17 @@ jobs:
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_DOMAIN: ${{ vars.GLADOS_DOMAIN || 'glados.network' }}
-        GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT }}
+        GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT || vars.GLADOS_USER_AGENT }}
+        GLADOS_DIAGNOSE_ONLY: ${{ inputs.diagnose_only || false }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
     - name: Keep alive
+      if: ${{ success() && !inputs.diagnose_only }}
       uses: liskin/gh-workflow-keepalive@v1 
         
     - name: Delete workflow runs
+      if: ${{ success() && !inputs.diagnose_only }}
       uses: Mattraks/delete-workflow-runs@v2
       with:
         token: ${{ github.token }}

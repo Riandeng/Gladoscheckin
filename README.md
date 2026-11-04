@@ -72,7 +72,7 @@
 
 ## 问题排查与定位
 - 大家可以通过查询 actions 中的 running checkin 日志快速定位问题，有其他问题提交issue。
-- 若日志出现 `code : 4, message : Automated check-in detected`：这是 GLaDOS 的**设备平台校验**（`reason=device-mismatch`，即签到请求 UA 平台与登录设备平台不一致）。脚本已内置**设备平台自适应**：首次失败时自动读取服务端返回的 `loginDevice` 并切换对应平台 UA 重试，**无需手动配置 User-Agent**；若长期仍失败，请重新登录 glados.cloud 手动签到一次并刷新 cookie。
+- 若日志出现 `code : 4`，不能仅凭 code 判断具体原因。仅当响应同时包含 `reason=device-mismatch`、服务端给出受支持的 `loginDevice`，且未显式配置 UA 时，脚本才尝试一次对应平台 UA。仍失败时，在实际登录域名重新登录，并更新完整 Cookie 和同一浏览器的 `GLADOS_USER_AGENT`；不会因失败自动切换域名。
 
   <img width="1684" height="844" alt="image" src="https://github.com/user-attachments/assets/45348a5f-43e4-45f5-8fdf-ce84d343b30d" />
 
@@ -123,7 +123,7 @@ https://github.com/Riandeng/Gladoscheckin/actions/runs/39102237296
 |---|---|---|
 | Secret | `GLADOS_COOKIES` | 已登录域名成功 `/api/user/status` 请求的完整 Cookie；保留所有会话与签名字段 |
 | Variable | `GLADOS_DOMAIN` | `glados.network`（默认；仅主机名，不含 https、路径）；也支持 `glados.cloud`、`railgun.info` |
-| Variable | `GLADOS_USER_AGENT` | 同一登录浏览器成功请求中的完整 User-Agent，单行复制 |
+| Secret 或 Variable | `GLADOS_USER_AGENT` | 同一登录浏览器成功请求中的完整 User-Agent，单行复制；非空 Secret 优先于 Variable |
 
 如果已经更新 Cookie，无需为此再读取旧值。仍需配置同一浏览器的 `GLADOS_USER_AGENT`。
 UA 对所有请求生效，并按 Chromium UA 构造平台 Client Hints；显式配置 UA 时不会被设备平台重试替换。
@@ -139,3 +139,27 @@ HTTP 重定向不会自动携带 Cookie 跟随，遇到 3xx 应核对浏览器�
 - [Walvez 的按登录域名执行设计](https://github.com/Walvez/glados-auto-checkin)：使用 Cookie 所属的登录域名，并让 token 匹配目标域名。
 
 这些记录支持兼容方向，但不是本账户的恢复证明；必须以本仓库修复版本的真实运行结果为准。
+
+
+## 2026-11 鉴权失效恢复
+
+同一提交 `0fd5be1` 在 [10 月 25 日运行](https://github.com/Riandeng/Gladoscheckin/actions/runs/40168109323) 中签到成功，
+[10 月 26 日](https://github.com/Riandeng/Gladoscheckin/actions/runs/40278851920) 起状态、签到和积分接口均返回 `code=-2`，
+[11 月 3 日](https://github.com/Riandeng/Gladoscheckin/actions/runs/41599701851) 仍失败。
+成功与失败运行都未配置浏览器 UA。因此能够确认鉴权被拒绝，但不能仅凭日志断言是某一种 Cookie 过期机制或 UA 导致。
+
+1. 在实际使用的域名重新登录，确认手动签到正常。在浏览器 Network 里选中成功的 `/api/user/status` 请求。
+2. 把该请求的完整 Cookie 更新到仓库 **Secret `GLADOS_COOKIES`**；把同一请求的 User-Agent 更新到 **Secret 或 Variable `GLADOS_USER_AGENT`**。若两处同时设置，非空 Secret 优先，请避免保留陈旧的重复配置。
+3. 将 **Variable `GLADOS_DOMAIN`** 设置为该请求的主机名（默认 `glados.network`）。不要把其他域名的 Cookie 直接用于这里。
+4. 使用包含本次修复的版本，在 Actions → auto check → Run workflow 勾选 `diagnose_only`，先进行只读验证。所有账号的状态接口返回整数 `code=0` 才通过；任一失败仍退出 1。
+5. 只读验证通过后，取消勾选再运行一次实际签到。当天已手动签到时，`code=1` 属于正常重复。状态查询通过不代表签到设备校验必然通过。
+
+只读验证仅查询状态，不签到、不兑换、不推送，也不执行工作流的保活及历史运行清理步骤；
+诊断日志不输出 Cookie、响应正文、邮箱或余额，即使 `GLADOS_VERBOSE=true` 也一样。
+GitHub 本身的工作流通知仍按个人设置发送。本地使用时设置 `GLADOS_DIAGNOSE_ONLY=true`。
+
+普通签到遇到明确的鉴权拒绝（HTTP 401/403、业务 `code=-2`，或最终仍是设备不匹配）后，
+会停止该账号的后续请求，保留失败退出码，并继续其他账号。网络异常和无效响应不会被诊断为确定的 Cookie 过期。
+签到失败时不执行自动兑换。
+
+**代码更新不会更新仓库凭据，也无法替你续签失效会话。** 测试使用模拟响应，测试通过与真实账户恢复是两件事。
